@@ -1,0 +1,11 @@
+{
+	"custom/claude": {
+		"exec": "~/.local/bin/claude-waybar data",
+		"return-type": "json",
+		"interval": 5,
+		"signal": 9,
+		"escape": false,
+		"on-click": "~/.local/bin/claude-waybar popup",
+		"on-click-right": "~/.local/bin/claude-waybar focus"
+	}
+}

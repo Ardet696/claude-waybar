@@ -1,0 +1,13 @@
+/* claude-waybar: label color follows the most recent session's state */
+#custom-claude {
+	padding: 0 12px;
+}
+#custom-claude.idle {
+	color: #89b4fa;
+}
+#custom-claude.running {
+	color: #f9e2af;
+}
+#custom-claude.waiting {
+	color: #cba6f7;
+}

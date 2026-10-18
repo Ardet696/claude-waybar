@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+#
+# Claude Code statusLine: stash the status payload for claude-waybar
+#
+# Usage: claude-waybar-statusline [command...]
+# With no command it prints nothing, so the Claude Code UI is unchanged.
+# With a command (your previous statusLine), the payload is passed through
+# to it and its output is shown as usual.
+#
+# Dependencies:
+#   - jq
+
+STATE_DIR=${XDG_RUNTIME_DIR:-/tmp}/claude-waybar
+
+payload=$(cat)
+session=$(jq -r '.session_id // empty' <<<"$payload")
+
+if [[ -n $session ]]; then
+	mkdir -p "$STATE_DIR"
+	printf '%s' "$payload" >"$STATE_DIR/$session.status.tmp" &&
+		mv "$STATE_DIR/$session.status.tmp" "$STATE_DIR/$session.status"
+fi
+
+if (($#)); then
+	exec bash -c "$*" <<<"$payload"
+fi

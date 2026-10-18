@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+#
+# Claude Code hook: record per-session state for claude-waybar
+#
+# Usage (from ~/.claude/settings.json hooks): claude-waybar-hook <event>
+# Reads the hook JSON payload on stdin.
+#
+# Dependencies:
+#   - jq
+#   - util-linux (flock)
+
+STATE_DIR=${XDG_RUNTIME_DIR:-/tmp}/claude-waybar
+SIGNAL=${CLAUDE_WAYBAR_SIGNAL:-9}
+
+find_claude_pid() {
+	local pid=$PPID comm
+	while ((pid > 1)); do
+		read -r comm </proc/"$pid"/comm 2>/dev/null || break
+		[[ $comm == claude ]] && { echo "$pid"; return; }
+		pid=$(awk '{print $4}' /proc/"$pid"/stat 2>/dev/null) || break
+	done
+	echo "$PPID"
+}
+
+main() {
+	local event=$1 payload session
+	payload=$(cat)
+	session=$(jq -r '.session_id // empty' <<<"$payload")
+	[[ -n $session ]] || return 0
+
+	mkdir -p "$STATE_DIR"
+	local file=$STATE_DIR/$session.json
+
+	if [[ $event == SessionEnd ]]; then
+		rm -f "$file" "$file.lock" "$STATE_DIR/$session.status"
+		pkill -RTMIN+$SIGNAL waybar
+		return 0
+	fi
+
+	# Async hooks can overlap (parallel tools, subagents), so serialize the read-modify-write
+	exec 9>"$file.lock"
+	flock -w 2 9 || return 0
+
+	local prev
+	prev=$(cat "$file" 2>/dev/null)
+	[[ -n $prev ]] || prev='{}'
+
+	jq -n --arg event "$event" --argjson prev "$prev" --argjson p "$payload" \
+		--argjson pid "$(find_claude_pid)" --argjson now "$(date +%s)" '
+		def set(s; d): .state = s | .detail = d | .ts = $now;
+
+		{agents: 0, agents_done: 0} + $prev + {
+			session: $p.session_id,
+			project: ($p.cwd // "" | split("/") | last),
+			pid: $pid
+		}
+		| if ($p.agent_id and ($event | test("ToolUse$"))) then .
+		elif $event == "SessionStart" then set("idle"; "")
+		elif $event == "UserPromptSubmit" then set("running"; "thinking")
+		elif $event == "PreToolUse" then set("running"; $p.tool_name // "tool")
+		elif $event == "PostToolUse" then set("running"; "thinking")
+		elif $event == "Stop" then set("waiting"; "your turn")
+		elif $event == "Notification" then
+			if ($p.notification_type // $p.message // "" | test("ermission"))
+			then set("waiting"; "permission") else . end
+		elif $event == "SubagentStart" then .agents += 1
+		elif $event == "SubagentStop" then
+			.agents = ([.agents - 1, 0] | max) | .agents_done += 1
+		else . end
+	' >"$file.tmp" && mv "$file.tmp" "$file"
+
+	pkill -RTMIN+$SIGNAL waybar
+	return 0
+}
+
+main "$@"

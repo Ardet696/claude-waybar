@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""Claude Code sessions for waybar: bar text, details popup, window focus.
+
+State comes from claude-waybar-hook (activity, agents) and claude-waybar-statusline
+(model, effort, context, rate limits), both under $XDG_RUNTIME_DIR/claude-waybar.
+
+Dependencies: python-gobject, gtk4, gtk4-layer-shell (popup), hyprland (focus)
+"""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from html import escape
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "claude-waybar"
+POPUP_PID = STATE_DIR / "popup.pid"
+LAYER_SHELL_LIB = "/usr/lib/libgtk4-layer-shell.so"
+
+WAITING_TTL = 600
+STALE_TTL = 6 * 3600
+BAR_CELLS = 10
+POPUP_MARGIN_LEFT = int(os.environ.get("CLAUDE_WAYBAR_POPUP_X", 330))
+
+C = {
+    "blue": "#89b4fa",
+    "yellow": "#f9e2af",
+    "mauve": "#cba6f7",
+    "green": "#a6e3a1",
+    "red": "#f38ba8",
+    "peach": "#fab387",
+    "teal": "#94e2d5",
+    "track": "#313244",
+    "dim": "#6c7086",
+}
+STATE_COLOR = {"idle": C["blue"], "running": C["yellow"], "waiting": C["mauve"]}
+LEGACY_STATE = {"working": "running", "thinking": "running", "done": "waiting"}
+
+
+def _hex(c):
+    return tuple(int(c[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def mix(a, b, t):
+    pa, pb = _hex(a), _hex(b)
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(pa, pb))
+
+
+def heat(t):
+    t = min(max(t, 0.0), 1.0)
+    if t < 0.6:
+        return mix(C["green"], C["yellow"], t / 0.6)
+    return mix(C["yellow"], C["red"], (t - 0.6) / 0.4)
+
+
+def fmt_tokens(n):
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    return f"{n // 1000}k" if n >= 1000 else str(n)
+
+
+def fmt_clock(sec):
+    sec = int(max(sec, 0))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def fmt_span(sec):
+    sec = int(max(sec, 0))
+    d, rem = divmod(sec, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    return f"{d}d{h}h" if d else f"{h}h{m:02d}m" if h else f"{m}m"
+
+
+def _read_json(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _pid_alive(pid):
+    return bool(pid) and Path(f"/proc/{pid}").exists()
+
+
+class Limit:
+    def __init__(self, label, raw, now):
+        self.label = label
+        self.pct = raw.get("used_percentage") or 0
+        resets = raw.get("resets_at")
+        self.resets_in = resets - now if resets else None
+
+
+class Session:
+    def __init__(self, sid, hook, status, status_mtime, now):
+        self.sid = sid
+        self._hook = hook
+        self._status = status
+        self._status_mtime = status_mtime
+        self.now = now
+
+    @property
+    def project(self):
+        ws = self._status.get("workspace") or {}
+        path = ws.get("project_dir") or self._status.get("cwd")
+        return Path(path).name if path else self._hook.get("project", "claude")
+
+    @property
+    def state(self):
+        state = LEGACY_STATE.get(self._hook.get("state"), self._hook.get("state", "idle"))
+        if state == "waiting" and self.now - self.since > WAITING_TTL:
+            return "idle"
+        return state if state in STATE_COLOR else "idle"
+
+    @property
+    def detail(self):
+        if self.state == "idle":
+            return "idle"
+        return self._hook.get("detail") or self.state
+
+    @property
+    def since(self):
+        return self._hook.get("ts", self._status_mtime)
+
+    @property
+    def last_active(self):
+        return max(self._hook.get("ts", 0), self._status_mtime)
+
+    @property
+    def pid(self):
+        return self._hook.get("pid")
+
+    @property
+    def alive(self):
+        if self.pid:
+            return _pid_alive(self.pid)
+        return self.now - self.last_active < STALE_TTL
+
+    @property
+    def model(self):
+        return (self._status.get("model") or {}).get("display_name", "Claude")
+
+    @property
+    def effort(self):
+        return (self._status.get("effort") or {}).get("level")
+
+    @property
+    def ctx_size(self):
+        return (self._status.get("context_window") or {}).get("context_window_size") or 200_000
+
+    @property
+    def ctx_used(self):
+        usage = (self._status.get("context_window") or {}).get("current_usage") or {}
+        return sum(usage.get(k, 0) for k in
+                   ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+
+    @property
+    def ctx_ratio(self):
+        return min(self.ctx_used / self.ctx_size, 1.0)
+
+    @property
+    def agents(self):
+        return self._hook.get("agents", 0)
+
+    @property
+    def agents_done(self):
+        return self._hook.get("agents_done", 0)
+
+    @property
+    def limits(self):
+        raw = self._status.get("rate_limits") or {}
+        return [Limit(label, raw[key], self.now)
+                for key, label in (("five_hour", "5H LIMIT"), ("seven_day", "7D LIMIT"))
+                if key in raw]
+
+
+class SessionStore:
+    def __init__(self, root=STATE_DIR):
+        self.root = root
+
+    def load(self):
+        now = time.time()
+        ids = {p.stem for p in self.root.glob("*.json")}
+        ids |= {p.stem for p in self.root.glob("*.status")}
+        sessions = []
+        for sid in ids:
+            status_path = self.root / f"{sid}.status"
+            try:
+                mtime = status_path.stat().st_mtime
+            except OSError:
+                mtime = 0
+            s = Session(sid, _read_json(self.root / f"{sid}.json"),
+                        _read_json(status_path), mtime, now)
+            if s.alive:
+                sessions.append(s)
+        return sorted(sessions, key=lambda s: (s.project, s.sid))
+
+    @staticmethod
+    def most_recent(sessions):
+        return max(sessions, key=lambda s: s.last_active) if sessions else None
+
+
+class BarRenderer:
+    def render(self, sessions):
+        top = SessionStore.most_recent(sessions)
+        if top is None:
+            return {"text": ""}
+        dots = " ".join(self._span(STATE_COLOR[s.state], "●") for s in sessions)
+        text = f"{dots} {escape(top.detail)} {self._gauge(top.ctx_ratio)}"
+        return {"text": text, "class": top.state, "tooltip": self._tooltip(sessions)}
+
+    @staticmethod
+    def _span(color, s):
+        return f'<span foreground="{color}">{s}</span>'
+
+    def _gauge(self, ratio):
+        filled = round(ratio * BAR_CELLS)
+        if ratio > 0 and filled == 0:
+            filled = 1
+        cells = [self._span(heat(i / (BAR_CELLS - 1)), "━") for i in range(filled)]
+        cells += [self._span(C["track"], "━")] * (BAR_CELLS - filled)
+        return "".join(cells)
+
+    @staticmethod
+    def _tooltip(sessions):
+        lines = [f"<b>{escape(s.project)}</b>: {escape(s.detail)} · {s.ctx_ratio:.0%} context" for s in sessions]
+        return "\n".join(lines + ["", "Click: details   Right-click: focus"])
+
+
+POPUP_CSS = """
+window { background-color: transparent; }
+* { font-family: "CommitMono Nerd Font", monospace; color: #cdd6f4; }
+#frame {
+    padding: 12px;
+    border: 1px solid #1b2540;
+    border-radius: 16px;
+    background-color: rgba(9, 9, 15, 0.97);
+}
+.header { font-size: 14px; font-weight: bold; margin: 2px 4px 4px 4px; }
+.card {
+    padding: 10px 12px;
+    border: 1px solid #1b2540;
+    border-radius: 10px;
+    background-color: #14141f;
+}
+.model { font-size: 15px; font-weight: bold; }
+.state { font-size: 12px; font-weight: bold; }
+.caption { font-size: 11px; color: #a6adc8; }
+.sub { font-size: 10px; color: #6c7086; }
+.value { font-size: 15px; font-weight: bold; }
+.tile { border-left: 3px solid; padding-left: 10px; }
+.accent-mauve { border-color: #cba6f7; }
+.empty { color: #6c7086; padding: 8px; }
+separator { background-color: #1b2540; min-height: 1px; margin: 6px 0; }
+"""
+
+
+class Popup:
+    """Layer-shell panel under the bar module; rebuilt every second, Esc or click closes."""
+
+    def __init__(self, store):
+        import gi
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Gtk4LayerShell", "1.0")
+        from gi.repository import GLib, Gtk, Gdk, Gtk4LayerShell as LayerShell
+        self.GLib, self.Gtk, self.Gdk, self.LayerShell = GLib, Gtk, Gdk, LayerShell
+        self.store = store
+        self.app = Gtk.Application(application_id="io.github.ardet696.claudewaybar")
+        self.app.connect("activate", self._build)
+        self.window = None
+
+    def run(self):
+        import gi
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        GLibUnix.signal_add(self.GLib.PRIORITY_DEFAULT, signal.SIGTERM, self._quit)
+        return self.app.run([])
+
+    def _quit(self, *_):
+        self.app.quit()
+        return False
+
+    def _build(self, app):
+        Gtk, LayerShell = self.Gtk, self.LayerShell
+        css = Gtk.CssProvider()
+        css.load_from_string(POPUP_CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            self.Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self.window = Gtk.ApplicationWindow(application=app)
+        self.window.set_resizable(False)
+        LayerShell.init_for_window(self.window)
+        LayerShell.set_namespace(self.window, "claude-waybar")
+        LayerShell.set_layer(self.window, LayerShell.Layer.OVERLAY)
+        LayerShell.set_anchor(self.window, LayerShell.Edge.TOP, True)
+        LayerShell.set_anchor(self.window, LayerShell.Edge.LEFT, True)
+        LayerShell.set_margin(self.window, LayerShell.Edge.TOP, 6)
+        LayerShell.set_margin(self.window, LayerShell.Edge.LEFT, POPUP_MARGIN_LEFT)
+        LayerShell.set_keyboard_mode(self.window, LayerShell.KeyboardMode.ON_DEMAND)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", lambda _c, key, *_: key == self.Gdk.KEY_Escape and self._quit())
+        self.window.add_controller(keys)
+        click = Gtk.GestureClick()
+        click.connect("released", lambda *_: self._quit())
+        self.window.add_controller(click)
+
+        self._refresh()
+        self.GLib.timeout_add_seconds(1, self._refresh)
+        self.window.present()
+
+    def _refresh(self):
+        sessions = self.store.load()
+        frame = self._box(vertical=True, spacing=8, name="frame")
+        frame.set_size_request(400, -1)
+        if not sessions:
+            frame.append(self._label("No Claude Code sessions", "empty"))
+        for i, s in enumerate(sorted(sessions, key=lambda s: -s.last_active)):
+            if i:
+                frame.append(self.Gtk.Separator())
+            for widget in self._session_widgets(s):
+                frame.append(widget)
+        top = SessionStore.most_recent(sessions)
+        for limit in top.limits if top else []:
+            sub = f"resets in {fmt_span(limit.resets_in)}" if limit.resets_in else ""
+            frame.append(self._meter(limit.label, limit.pct / 100, sub))
+        self.window.set_child(frame)
+        return True
+
+    def _session_widgets(self, s):
+        Gtk = self.Gtk
+        color = STATE_COLOR[s.state]
+        header = self._label(f'<span foreground="{C["peach"]}">◆</span> {escape(s.project)}', "header")
+
+        status = self._box(spacing=12, css="card")
+        status.append(self._label(f'<span foreground="{color}" size="xx-large">●</span>'))
+        left = self._box(vertical=True)
+        left.append(self._label(s.model, "model"))
+        left.append(self._label(f"effort · {s.effort}" if s.effort else "", "sub"))
+        left.set_hexpand(True)
+        status.append(left)
+        right = self._box(vertical=True)
+        right.append(self._label(f'<span foreground="{color}">{s.state.upper()}</span>',
+                                 "state", xalign=1))
+        since = fmt_clock(s.now - s.since)
+        activity = since if s.state == "idle" else f"{escape(s.detail)} · {since}"
+        right.append(self._label(activity, "sub", xalign=1))
+        status.append(right)
+
+        ctx = self._meter("CONTEXT", s.ctx_ratio,
+                          f"{fmt_tokens(s.ctx_used)} of {fmt_tokens(s.ctx_size)}")
+
+        agents = self._tile("AGENTS", f"{s.agents} running", f"{s.agents_done} done", "mauve")
+        return [header, status, ctx, agents]
+
+    def _meter(self, caption, ratio, sub):
+        Gtk = self.Gtk
+        card = self._box(vertical=True, spacing=6, css="card")
+        row = self._box()
+        cap = self._label(caption, "caption")
+        cap.set_hexpand(True)
+        row.append(cap)
+        row.append(self._label(f"{ratio:.0%}", "value", xalign=1))
+        card.append(row)
+        bar = Gtk.DrawingArea()
+        bar.set_content_height(8)
+        bar.set_draw_func(self._draw_gauge, ratio)
+        card.append(bar)
+        if sub:
+            card.append(self._label(sub, "sub"))
+        return card
+
+    @staticmethod
+    def _draw_gauge(_area, cr, w, h, ratio):
+        import math
+
+        def rounded(width):
+            r = h / 2
+            cr.new_sub_path()
+            cr.arc(width - r, r, r, -math.pi / 2, math.pi / 2)
+            cr.arc(r, r, r, math.pi / 2, 3 * math.pi / 2)
+            cr.close_path()
+
+        cr.set_source_rgb(*(v / 255 for v in _hex(C["track"])))
+        rounded(w)
+        cr.fill()
+        if ratio <= 0:
+            return
+        import cairo
+        grad = cairo.LinearGradient(0, 0, w, 0)
+        for stop in (0.0, 0.3, 0.6, 0.8, 1.0):
+            grad.add_color_stop_rgb(stop, *(v / 255 for v in _hex(heat(stop))))
+        cr.set_source(grad)
+        rounded(max(w * ratio, h))
+        cr.fill()
+
+    def _tile(self, caption, value, sub, accent):
+        tile = self._box(vertical=True, spacing=2, css="card")
+        inner = self._box(vertical=True, spacing=2, css="tile")
+        inner.add_css_class(f"accent-{accent}")
+        inner.append(self._label(caption, "caption"))
+        inner.append(self._label(value, "value"))
+        inner.append(self._label(sub, "sub"))
+        tile.append(inner)
+        return tile
+
+    def _box(self, vertical=False, spacing=0, css=None, name=None, homogeneous=False):
+        Gtk = self.Gtk
+        orient = Gtk.Orientation.VERTICAL if vertical else Gtk.Orientation.HORIZONTAL
+        box = Gtk.Box(orientation=orient, spacing=spacing, homogeneous=homogeneous)
+        if css:
+            box.add_css_class(css)
+        if name:
+            box.set_name(name)
+        return box
+
+    def _label(self, markup, css=None, xalign=0):
+        label = self.Gtk.Label(xalign=xalign)
+        label.set_markup(markup)
+        if css:
+            label.add_css_class(css)
+        return label
+
+
+def focus_session():
+    top = SessionStore.most_recent(SessionStore().load())
+    if top is None or not top.pid:
+        return 1
+    clients = json.loads(subprocess.run(["hyprctl", "clients", "-j"],
+                                        capture_output=True, text=True).stdout or "[]")
+    client_pids = {c["pid"] for c in clients}
+    pid = top.pid
+    while pid > 1:
+        if pid in client_pids:
+            subprocess.run(["hyprctl", "dispatch", "focuswindow", f"pid:{pid}"],
+                           capture_output=True)
+            return 0
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            return 1
+    return 1
+
+
+def toggle_popup():
+    try:
+        pid = int(POPUP_PID.read_text())
+        if _pid_alive(pid):
+            os.kill(pid, signal.SIGTERM)
+            return 0
+    except (OSError, ValueError):
+        pass
+
+    if LAYER_SHELL_LIB not in os.environ.get("LD_PRELOAD", ""):
+        env = dict(os.environ, LD_PRELOAD=LAYER_SHELL_LIB)
+        os.execve(sys.executable, [sys.executable, *sys.argv], env)
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    POPUP_PID.write_text(str(os.getpid()))
+    try:
+        return Popup(SessionStore()).run()
+    finally:
+        POPUP_PID.unlink(missing_ok=True)
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "data":
+        print(json.dumps(BarRenderer().render(SessionStore().load())))
+        return 0
+    if cmd == "focus":
+        return focus_session()
+    if cmd == "popup":
+        return toggle_popup()
+    print(f"{Path(sys.argv[0]).name}: {Path(sys.argv[0]).name} data|popup|focus", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
