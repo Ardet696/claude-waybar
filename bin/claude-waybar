@@ -3,16 +3,20 @@
 
 State comes from claude-waybar-hook (activity, agents) and claude-waybar-statusline
 (model, effort, context, rate limits), both under $XDG_RUNTIME_DIR/claude-waybar.
+Hosts that never run the statusLine (VS Code) and subagents are read from their
+JSONL transcripts instead.
 
 Dependencies: python-gobject, gtk4, gtk4-layer-shell (popup), hyprland (focus)
 """
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
+from datetime import datetime
 from html import escape
 from pathlib import Path
 
@@ -24,6 +28,15 @@ WAITING_TTL = 600
 STALE_TTL = 6 * 3600
 BAR_CELLS = 10
 POPUP_MARGIN_LEFT = int(os.environ.get("CLAUDE_WAYBAR_POPUP_X", 330))
+POPUP_MAX_HEIGHT = int(os.environ.get("CLAUDE_WAYBAR_POPUP_MAX_HEIGHT", 900))
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+BAR_TAIL_BYTES = 512 * 1024
+DEFAULT_WINDOW = 200_000
+EXTENDED_WINDOW = 1_000_000
+AGENT_STALL_TTL = 15 * 60
+AGENT_STOP_GRACE = 2
+DONE_AGENTS_SHOWN = 4
+PROCESS_SCAN_INTERVAL = 3
 
 C = {
     "blue": "#89b4fa",
@@ -36,7 +49,10 @@ C = {
     "track": "#313244",
     "dim": "#6c7086",
 }
-STATE_COLOR = {"idle": C["blue"], "running": C["yellow"], "waiting": C["mauve"]}
+STATE_COLOR = {"idle": C["blue"], "running": C["yellow"], "waiting": C["mauve"], "agents": C["teal"]}
+AGENT_MANAGEMENT_TOOLS = {"Agent", "Task", "SendMessage", "TaskStop"}
+AGENT_COLOR = {"running": C["yellow"], "stalled": C["red"], "stopped": C["peach"], "done": C["green"]}
+AGENT_ORDER = {"running": 0, "stalled": 1, "stopped": 2, "done": 3}
 LEGACY_STATE = {"working": "running", "thinking": "running", "done": "waiting"}
 
 
@@ -77,6 +93,21 @@ def fmt_span(sec):
     return f"{d}d{h}h" if d else f"{h}h{m:02d}m" if h else f"{m}m"
 
 
+def fmt_bytes(n):
+    for unit, size in (("G", 1 << 30), ("M", 1 << 20)):
+        if n >= size:
+            return f"{n / size:.1f}{unit}"
+    return f"{n >> 10}k"
+
+
+def fmt_model(model_id):
+    match = re.match(r"claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$", model_id or "")
+    if not match:
+        return model_id or "Claude"
+    family, major, minor = match.groups()
+    return f"{family.capitalize()} {major}.{minor}" if minor else f"{family.capitalize()} {major}"
+
+
 def _read_json(path):
     try:
         return json.loads(path.read_text())
@@ -96,13 +127,318 @@ class Limit:
         self.resets_in = resets - now if resets else None
 
 
+class Transcript:
+    """Incremental reader of a JSONL transcript; keeps only derived fields in memory."""
+
+    _RELEVANT = (b'"type":"assistant"', b'"type":"user"')
+
+    def __init__(self, path, tail_limit=None):
+        self.path = path
+        self._tail_limit = tail_limit
+        self._reset()
+
+    def _reset(self):
+        self._offset = 0
+        self._message_id = None
+        self._message_output = 0
+        self.mtime = 0
+        self.started = None
+        self.last_ts = None
+        self.model = None
+        self.effort = None
+        self.ctx_used = 0
+        self.tools = 0
+        self.output_tokens = 0
+        self.last_text = ""
+        self.last_tool = ""
+        self.finished = False
+        self.notified_by = None
+
+    def refresh(self):
+        try:
+            stat = os.stat(self.path)
+        except OSError:
+            return self
+        if stat.st_size < self._offset:
+            self._reset()
+        self.mtime = stat.st_mtime
+        if stat.st_size == self._offset:
+            return self
+        start = self._offset
+        partial = False
+        if start == 0 and self._tail_limit and stat.st_size > self._tail_limit:
+            start = stat.st_size - self._tail_limit
+            partial = True
+        with open(self.path, "rb") as f:
+            f.seek(start)
+            chunk = f.read()
+        end = chunk.rfind(b"\n")
+        if end < 0:
+            return self
+        self._offset = start + end + 1
+        lines = chunk[:end].split(b"\n")
+        for line in lines[1:] if partial else lines:
+            if any(marker in line for marker in self._RELEVANT):
+                self._ingest(line)
+        return self
+
+    def _ingest(self, line):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            return
+        kind = record.get("type")
+        if kind not in ("assistant", "user"):
+            return
+        self._touch(record.get("timestamp"))
+        if kind == "user":
+            self.finished = False
+            self._note_prompt(record)
+            return
+        message = record.get("message") or {}
+        self.finished = message.get("stop_reason") not in (None, "tool_use")
+        self.effort = record.get("effort") or self.effort
+        if message.get("model") not in (None, "<synthetic>"):
+            self.model = message["model"]
+            self._account(message)
+        for block in message.get("content") or []:
+            if block.get("type") == "tool_use":
+                self.tools += 1
+                self.last_tool = self._describe_tool(block)
+            elif block.get("type") == "text" and block.get("text", "").strip():
+                self.last_text = block["text"].strip().splitlines()[0][:200]
+
+    def _note_prompt(self, record):
+        content = (record.get("message") or {}).get("content")
+        if isinstance(content, list) and all(b.get("type") == "tool_result" for b in content):
+            return
+        self.notified_by = None
+        if (record.get("origin") or {}).get("kind") == "task-notification":
+            match = re.search(r"<tool-use-id>([^<]+)</tool-use-id>", str(content))
+            self.notified_by = match.group(1) if match else None
+
+    def _touch(self, stamp):
+        try:
+            ts = datetime.fromisoformat(stamp).timestamp()
+        except (TypeError, ValueError):
+            return
+        self.started = self.started or ts
+        self.last_ts = ts
+
+    def _account(self, message):
+        usage = message.get("usage") or {}
+        used = sum(usage.get(k, 0) for k in
+                   ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+        if used:
+            self.ctx_used = used
+        output = usage.get("output_tokens", 0)
+        if message.get("id") != self._message_id:
+            self._message_id = message.get("id")
+            self._message_output = 0
+        self.output_tokens += output - self._message_output
+        self._message_output = output
+
+    @staticmethod
+    def _describe_tool(block):
+        args = block.get("input") or {}
+        for key in ("description", "command", "file_path", "pattern", "url", "prompt"):
+            value = args.get(key)
+            if isinstance(value, str) and value.strip():
+                return f"{block.get('name', 'tool')} · {value.strip().splitlines()[0][:200]}"
+        return block.get("name", "tool")
+
+
+class TranscriptStore:
+    def __init__(self, tail_limit=None):
+        self._tail_limit = tail_limit
+        self._open = {}
+        self._located = {}
+
+    def locate(self, sid):
+        if sid not in self._located:
+            match = next((CLAUDE_HOME / "projects").glob(f"*/{sid}.jsonl"), None)
+            if match is None:
+                return None
+            self._located[sid] = str(match)
+        return self._located[sid]
+
+    def get(self, path):
+        transcript = self._open.get(path)
+        if transcript is None:
+            transcript = self._open[path] = Transcript(path, self._tail_limit)
+        return transcript.refresh()
+
+    def agents(self, session_transcript):
+        """Pairs of (agent id, metadata, transcript) for a session's subagents."""
+        root = Path(session_transcript).with_suffix("") / "subagents"
+        found = []
+        for meta_path in root.glob("agent-*.meta.json"):
+            log = meta_path.with_name(meta_path.name.replace(".meta.json", ".jsonl"))
+            if self._tail_limit and not self._recent(log):
+                continue
+            agent_id = log.stem.removeprefix("agent-")
+            found.append((agent_id, _read_json(meta_path), self.get(str(log))))
+        return found
+
+
+    @staticmethod
+    def _recent(path):
+        try:
+            return time.time() - path.stat().st_mtime <= AGENT_STALL_TTL
+        except OSError:
+            return False
+
+
+class ContextWindows:
+    """Window size per model, learned from sessions that do report it via statusLine."""
+
+    def __init__(self):
+        self._known = {}
+
+    def learn(self, status):
+        model_id = (status.get("model") or {}).get("id")
+        size = (status.get("context_window") or {}).get("context_window_size")
+        if model_id and size:
+            self._known[model_id.split("[")[0]] = size
+
+    def size_for(self, model_id, used):
+        size = self._known.get(model_id, DEFAULT_WINDOW)
+        return EXTENDED_WINDOW if used > size else size
+
+
+class Agent:
+    def __init__(self, agent_id, meta, transcript, stopped_at, windows, now):
+        self.agent_id = agent_id
+        self._meta = meta
+        self._transcript = transcript
+        self._stopped_at = stopped_at
+        self._windows = windows
+        self.now = now
+
+    @property
+    def tool_use_id(self):
+        return self._meta.get("toolUseId")
+
+    @property
+    def description(self):
+        return self._meta.get("description") or self.agent_id
+
+    @property
+    def kind(self):
+        return self._meta.get("agentType") or "agent"
+
+    @property
+    def state(self):
+        t = self._transcript
+        if t.finished:
+            return "done"
+        if self._stopped_at and t.mtime <= self._stopped_at + AGENT_STOP_GRACE:
+            return "stopped"
+        return "stalled" if self.now - t.mtime > AGENT_STALL_TTL else "running"
+
+    @property
+    def model(self):
+        return fmt_model(self._transcript.model or self._meta.get("model"))
+
+    @property
+    def elapsed(self):
+        t = self._transcript
+        end = self.now if self.state == "running" else (t.last_ts or t.mtime)
+        return end - (t.started or end)
+
+    @property
+    def activity(self):
+        t = self._transcript
+        return (t.last_text or t.last_tool) if t.finished else (t.last_tool or t.last_text)
+
+    @property
+    def quiet_for(self):
+        return self.now - self._transcript.mtime
+
+    @property
+    def last_active(self):
+        return self._transcript.mtime
+
+    @property
+    def tools(self):
+        return self._transcript.tools
+
+    @property
+    def output_tokens(self):
+        return self._transcript.output_tokens
+
+    @property
+    def ctx_used(self):
+        return self._transcript.ctx_used
+
+    @property
+    def ctx_size(self):
+        return self._windows.size_for(self._transcript.model, self.ctx_used)
+
+    @property
+    def ctx_ratio(self):
+        return min(self.ctx_used / self.ctx_size, 1.0)
+
+
+class ProcessScanner:
+    """Counts each session's child processes through the session id in their environment."""
+
+    _MARKER = b"CLAUDE_CODE_SESSION_ID="
+    _PAGE = os.sysconf("SC_PAGE_SIZE")
+
+    def __init__(self):
+        self._at = 0
+        self._usage = {}
+
+    def usage(self, sid):
+        now = time.monotonic()
+        if now - self._at >= PROCESS_SCAN_INTERVAL:
+            self._usage = self._scan()
+            self._at = now
+        return self._usage.get(sid, (0, 0))
+
+    def _scan(self):
+        usage = {}
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                sid = self._session_of((entry / "environ").read_bytes())
+                if sid is None:
+                    continue
+                rss = int((entry / "statm").read_text().split()[1]) * self._PAGE
+            except (OSError, ValueError, IndexError):
+                continue
+            count, total = usage.get(sid, (0, 0))
+            usage[sid] = (count + 1, total + rss)
+        return usage
+
+    def _session_of(self, environ):
+        for var in environ.split(b"\0"):
+            if var.startswith(self._MARKER):
+                return var[len(self._MARKER):].decode()
+        return None
+
+
 class Session:
-    def __init__(self, sid, hook, status, status_mtime, now):
+    def __init__(self, sid, hook, status, status_mtime, transcripts, windows, now):
         self.sid = sid
         self._hook = hook
         self._status = status
         self._status_mtime = status_mtime
+        self._transcripts = transcripts
+        self._windows = windows
+        self._agents = None
         self.now = now
+
+    @property
+    def _transcript_path(self):
+        return self._status.get("transcript_path") or self._transcripts.locate(self.sid)
+
+    @property
+    def _transcript(self):
+        path = self._transcript_path
+        return self._transcripts.get(path) if path else None
 
     @property
     def project(self):
@@ -111,17 +447,36 @@ class Session:
         return Path(path).name if path else self._hook.get("project", "claude")
 
     @property
+    def _managing_agents(self):
+        if self._hook.get("state") == "running" and self._hook.get("detail") in AGENT_MANAGEMENT_TOOLS:
+            return True
+        transcript = self._transcript
+        if transcript is None or transcript.finished or not transcript.notified_by:
+            return False
+        return any(a.tool_use_id == transcript.notified_by for a in self.agents)
+
+    @property
     def state(self):
         state = LEGACY_STATE.get(self._hook.get("state"), self._hook.get("state", "idle"))
+        if self._managing_agents:
+            return "running"
+        if state != "running" and self._hook.get("detail") != "permission" and self.agent_count("running"):
+            return "agents"
         if state == "waiting" and self.now - self.since > WAITING_TTL:
             return "idle"
         return state if state in STATE_COLOR else "idle"
 
     @property
     def detail(self):
-        if self.state == "idle":
+        if self._managing_agents:
+            return "managing agents"
+        state = self.state
+        if state == "agents":
+            count = self.agent_count("running")
+            return f"waiting for {count} agents" if count > 1 else "waiting for agent"
+        if state == "idle":
             return "idle"
-        return self._hook.get("detail") or self.state
+        return self._hook.get("detail") or state
 
     @property
     def since(self):
@@ -143,21 +498,37 @@ class Session:
 
     @property
     def model(self):
-        return (self._status.get("model") or {}).get("display_name", "Claude")
+        name = (self._status.get("model") or {}).get("display_name")
+        if name:
+            return name
+        transcript = self._transcript
+        return fmt_model(transcript.model if transcript else None)
 
     @property
     def effort(self):
-        return (self._status.get("effort") or {}).get("level")
+        level = (self._status.get("effort") or {}).get("level")
+        if level:
+            return level
+        transcript = self._transcript
+        return transcript.effort if transcript else None
 
     @property
     def ctx_size(self):
-        return (self._status.get("context_window") or {}).get("context_window_size") or 200_000
+        size = (self._status.get("context_window") or {}).get("context_window_size")
+        if size:
+            return size
+        transcript = self._transcript
+        return self._windows.size_for(transcript.model if transcript else None, self.ctx_used)
 
     @property
     def ctx_used(self):
         usage = (self._status.get("context_window") or {}).get("current_usage") or {}
-        return sum(usage.get(k, 0) for k in
+        used = sum(usage.get(k, 0) for k in
                    ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+        if used:
+            return used
+        transcript = self._transcript
+        return transcript.ctx_used if transcript else 0
 
     @property
     def ctx_ratio(self):
@@ -165,11 +536,24 @@ class Session:
 
     @property
     def agents(self):
-        return self._hook.get("agents", 0)
+        if self._agents is None:
+            path = self._transcript_path
+            stopped = self._hook.get("stopped_agents") or {}
+            found = self._transcripts.agents(path) if path else []
+            self._agents = sorted(
+                (Agent(aid, meta, log, stopped.get(aid), self._windows, self.now)
+                 for aid, meta, log in found),
+                key=lambda a: (AGENT_ORDER[a.state], -a.last_active))
+        return self._agents
+
+    def agent_count(self, state):
+        return sum(a.state == state for a in self.agents)
 
     @property
-    def agents_done(self):
-        return self._hook.get("agents_done", 0)
+    def agent_summary(self):
+        parts = [f"{self.agent_count(state)} {state}"
+                 for state in ("stalled", "stopped", "done") if self.agent_count(state)]
+        return " · ".join(parts) or "0 done"
 
     @property
     def limits(self):
@@ -180,11 +564,15 @@ class Session:
 
 
 class SessionStore:
-    def __init__(self, root=STATE_DIR):
+    def __init__(self, root=STATE_DIR, tail_limit=None):
         self.root = root
+        self.transcripts = TranscriptStore(tail_limit)
 
     def load(self):
         now = time.time()
+        windows = ContextWindows()
+        for path in self.root.glob("*.status"):
+            windows.learn(_read_json(path))
         ids = {p.stem for p in self.root.glob("*.json")}
         ids |= {p.stem for p in self.root.glob("*.status")}
         sessions = []
@@ -195,7 +583,7 @@ class SessionStore:
             except OSError:
                 mtime = 0
             s = Session(sid, _read_json(self.root / f"{sid}.json"),
-                        _read_json(status_path), mtime, now)
+                        _read_json(status_path), mtime, self.transcripts, windows, now)
             if s.alive:
                 sessions.append(s)
         return sorted(sessions, key=lambda s: (s.project, s.sid))
@@ -203,6 +591,11 @@ class SessionStore:
     @staticmethod
     def most_recent(sessions):
         return max(sessions, key=lambda s: s.last_active) if sessions else None
+
+    @staticmethod
+    def latest_limits(sessions):
+        reporting = [s for s in sessions if s.limits]
+        return SessionStore.most_recent(reporting).limits if reporting else []
 
 
 class BarRenderer:
@@ -257,19 +650,32 @@ window { background-color: transparent; }
 .accent-mauve { border-color: #cba6f7; }
 .empty { color: #6c7086; padding: 8px; }
 separator { background-color: #1b2540; min-height: 1px; margin: 6px 0; }
+button.tab {
+    min-height: 0;
+    padding: 3px 14px;
+    border: 1px solid #1b2540;
+    border-radius: 8px;
+    background: transparent;
+    box-shadow: none;
+    font-size: 11px;
+}
+button.tab.active { border-color: #cba6f7; background: #14141f; font-weight: bold; }
+.agent-title { font-size: 12px; font-weight: bold; }
 """
 
 
 class Popup:
     """Layer-shell panel under the bar module; rebuilt every second, Esc or click closes."""
 
-    def __init__(self, store):
+    def __init__(self, store, view="sessions"):
         import gi
         gi.require_version("Gtk", "4.0")
         gi.require_version("Gtk4LayerShell", "1.0")
-        from gi.repository import GLib, Gtk, Gdk, Gtk4LayerShell as LayerShell
-        self.GLib, self.Gtk, self.Gdk, self.LayerShell = GLib, Gtk, Gdk, LayerShell
+        from gi.repository import GLib, Gtk, Gdk, Pango, Gtk4LayerShell as LayerShell
+        self.GLib, self.Gtk, self.Gdk, self.Pango, self.LayerShell = GLib, Gtk, Gdk, Pango, LayerShell
         self.store = store
+        self.view = view
+        self.processes = ProcessScanner()
         self.app = Gtk.Application(application_id="io.github.ardet696.claudewaybar")
         self.app.connect("activate", self._build)
         self.window = None
@@ -304,33 +710,133 @@ class Popup:
         LayerShell.set_keyboard_mode(self.window, LayerShell.KeyboardMode.ON_DEMAND)
 
         keys = Gtk.EventControllerKey()
-        keys.connect("key-pressed", lambda _c, key, *_: key == self.Gdk.KEY_Escape and self._quit())
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self._on_key)
         self.window.add_controller(keys)
         click = Gtk.GestureClick()
-        click.connect("released", lambda *_: self._quit())
+        click.connect("released", self._on_click)
         self.window.add_controller(click)
+
+        root = self._box(vertical=True, spacing=8, name="frame")
+        root.set_size_request(400, -1)
+        tabs = self._box(spacing=6)
+        self.tab_buttons = {}
+        for view, title in (("sessions", "Sessions"), ("agents", "Agents")):
+            button = Gtk.Button(label=title)
+            button.add_css_class("tab")
+            button.connect("clicked", lambda _b, v=view: self._show(v))
+            tabs.append(button)
+            self.tab_buttons[view] = button
+        root.append(tabs)
+
+        self.body = self._box(vertical=True)
+        scroller = Gtk.ScrolledWindow(propagate_natural_height=True,
+                                      max_content_height=POPUP_MAX_HEIGHT)
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_child(self.body)
+        root.append(scroller)
+        self.content = None
+        self.window.set_child(root)
 
         self._refresh()
         self.GLib.timeout_add_seconds(1, self._refresh)
         self.window.present()
 
+    def _on_key(self, _controller, key, *_):
+        if key == self.Gdk.KEY_Escape:
+            self._quit()
+            return True
+        if key == self.Gdk.KEY_Tab:
+            self._show("agents" if self.view == "sessions" else "sessions")
+            return True
+        return False
+
+    def _on_click(self, _gesture, _n, x, y):
+        widget = self.window.pick(x, y, self.Gtk.PickFlags.DEFAULT)
+        while widget is not None:
+            if isinstance(widget, self.Gtk.Button):
+                return
+            widget = widget.get_parent()
+        self._quit()
+
+    def _show(self, view):
+        self.view = view
+        self._refresh()
+
     def _refresh(self):
-        sessions = self.store.load()
-        frame = self._box(vertical=True, spacing=8, name="frame")
-        frame.set_size_request(400, -1)
-        if not sessions:
-            frame.append(self._label("No Claude Code sessions", "empty"))
-        for i, s in enumerate(sorted(sessions, key=lambda s: -s.last_active)):
-            if i:
-                frame.append(self.Gtk.Separator())
-            for widget in self._session_widgets(s):
-                frame.append(widget)
-        top = SessionStore.most_recent(sessions)
-        for limit in top.limits if top else []:
-            sub = f"resets in {fmt_span(limit.resets_in)}" if limit.resets_in else ""
-            frame.append(self._meter(limit.label, limit.pct / 100, sub))
-        self.window.set_child(frame)
+        sessions = sorted(self.store.load(), key=lambda s: -s.last_active)
+        running = sum(s.agent_count("running") for s in sessions)
+        self.tab_buttons["agents"].set_label(f"Agents ({running})" if running else "Agents")
+        for view, button in self.tab_buttons.items():
+            (button.add_css_class if view == self.view else button.remove_css_class)("active")
+
+        content = self._box(vertical=True, spacing=8)
+        fill = self._fill_agents if self.view == "agents" else self._fill_sessions
+        fill(content, sessions)
+        self.body.append(content)
+        if self.content is not None:
+            self.body.remove(self.content)
+        self.content = content
         return True
+
+    def _fill_sessions(self, content, sessions):
+        if not sessions:
+            content.append(self._label("No Claude Code sessions", "empty"))
+        for i, s in enumerate(sessions):
+            if i:
+                content.append(self.Gtk.Separator())
+            for widget in self._session_widgets(s):
+                content.append(widget)
+        for limit in SessionStore.latest_limits(sessions):
+            sub = f"resets in {fmt_span(limit.resets_in)}" if limit.resets_in else ""
+            content.append(self._meter(limit.label, limit.pct / 100, sub))
+
+    def _fill_agents(self, content, sessions):
+        sessions = [s for s in sessions if s.agents]
+        if not sessions:
+            content.append(self._label("No subagents in live sessions", "empty"))
+        for i, s in enumerate(sessions):
+            if i:
+                content.append(self.Gtk.Separator())
+            content.append(self._agents_header(s))
+            done = [a for a in s.agents if a.state == "done"]
+            shown = [a for a in s.agents if a.state != "done"] + done[:DONE_AGENTS_SHOWN]
+            for agent in shown:
+                content.append(self._agent_card(agent))
+            if len(done) > DONE_AGENTS_SHOWN:
+                content.append(self._label(f"+{len(done) - DONE_AGENTS_SHOWN} earlier finished", "sub"))
+
+    def _agents_header(self, s):
+        box = self._box(vertical=True, spacing=2)
+        box.append(self._label(f'<span foreground="{C["peach"]}">◆</span> {escape(s.project)}', "header"))
+        count, rss = self.processes.usage(s.sid)
+        facts = [escape(s.model), f"{s.ctx_ratio:.0%} ctx",
+                 f'{s.agent_count("running")} running', escape(s.agent_summary)]
+        if count:
+            facts.append(f"{count} procs {fmt_bytes(rss)}")
+        box.append(self._label(" · ".join(facts), "sub"))
+        return box
+
+    def _agent_card(self, a):
+        card = self._box(vertical=True, spacing=4, css="card")
+        color = AGENT_COLOR[a.state]
+        top = self._box(spacing=8)
+        title = self._label(f'<span foreground="{color}">●</span> {escape(a.description)}',
+                            "agent-title", max_chars=38)
+        title.set_hexpand(True)
+        top.append(title)
+        top.append(self._label(f'<span foreground="{color}">{a.state.upper()}</span>', "state", xalign=1))
+        card.append(top)
+        card.append(self._label(f"{escape(a.kind)} · {escape(a.model)} · {fmt_clock(a.elapsed)}", "sub"))
+        if a.activity:
+            card.append(self._label(escape(a.activity), "caption", max_chars=52))
+        card.append(self._gauge(a.ctx_ratio, 5))
+        stats = [f"ctx {fmt_tokens(a.ctx_used)}/{fmt_tokens(a.ctx_size)} {a.ctx_ratio:.0%}",
+                 f"{a.tools} tools", f"{fmt_tokens(a.output_tokens)} out"]
+        if a.state != "done":
+            stats.append(f"quiet {fmt_clock(a.quiet_for)}")
+        card.append(self._label(" · ".join(stats), "sub"))
+        return card
 
     def _session_widgets(self, s):
         Gtk = self.Gtk
@@ -355,7 +861,7 @@ class Popup:
         ctx = self._meter("CONTEXT", s.ctx_ratio,
                           f"{fmt_tokens(s.ctx_used)} of {fmt_tokens(s.ctx_size)}")
 
-        agents = self._tile("AGENTS", f"{s.agents} running", f"{s.agents_done} done", "mauve")
+        agents = self._tile("AGENTS", f'{s.agent_count("running")} running', s.agent_summary, "mauve")
         return [header, status, ctx, agents]
 
     def _meter(self, caption, ratio, sub):
@@ -367,13 +873,16 @@ class Popup:
         row.append(cap)
         row.append(self._label(f"{ratio:.0%}", "value", xalign=1))
         card.append(row)
-        bar = Gtk.DrawingArea()
-        bar.set_content_height(8)
-        bar.set_draw_func(self._draw_gauge, ratio)
-        card.append(bar)
+        card.append(self._gauge(ratio, 8))
         if sub:
             card.append(self._label(sub, "sub"))
         return card
+
+    def _gauge(self, ratio, height):
+        bar = self.Gtk.DrawingArea()
+        bar.set_content_height(height)
+        bar.set_draw_func(self._draw_gauge, ratio)
+        return bar
 
     @staticmethod
     def _draw_gauge(_area, cr, w, h, ratio):
@@ -419,9 +928,12 @@ class Popup:
             box.set_name(name)
         return box
 
-    def _label(self, markup, css=None, xalign=0):
+    def _label(self, markup, css=None, xalign=0, max_chars=None):
         label = self.Gtk.Label(xalign=xalign)
         label.set_markup(markup)
+        if max_chars:
+            label.set_ellipsize(self.Pango.EllipsizeMode.END)
+            label.set_max_width_chars(max_chars)
         if css:
             label.add_css_class(css)
         return label
@@ -447,7 +959,7 @@ def focus_session():
     return 1
 
 
-def toggle_popup():
+def toggle_popup(view):
     try:
         pid = int(POPUP_PID.read_text())
         if _pid_alive(pid):
@@ -463,7 +975,7 @@ def toggle_popup():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     POPUP_PID.write_text(str(os.getpid()))
     try:
-        return Popup(SessionStore()).run()
+        return Popup(SessionStore(), view).run()
     finally:
         POPUP_PID.unlink(missing_ok=True)
 
@@ -471,13 +983,13 @@ def toggle_popup():
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "data":
-        print(json.dumps(BarRenderer().render(SessionStore().load())))
+        print(json.dumps(BarRenderer().render(SessionStore(tail_limit=BAR_TAIL_BYTES).load())))
         return 0
     if cmd == "focus":
         return focus_session()
     if cmd == "popup":
-        return toggle_popup()
-    print(f"{Path(sys.argv[0]).name}: {Path(sys.argv[0]).name} data|popup|focus", file=sys.stderr)
+        return toggle_popup("agents" if sys.argv[2:] == ["agents"] else "sessions")
+    print(f"{Path(sys.argv[0]).name}: {Path(sys.argv[0]).name} data|popup [agents]|focus", file=sys.stderr)
     return 1
 
 

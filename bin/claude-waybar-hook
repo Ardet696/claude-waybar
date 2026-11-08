@@ -66,6 +66,7 @@ main() {
 		elif $event == "SubagentStart" then .agents += 1
 		elif $event == "SubagentStop" then
 			.agents = ([.agents - 1, 0] | max) | .agents_done += 1
+			| .stopped_agents[$p.agent_id // "unknown"] = $now
 		else . end
 	' >"$file.tmp" && mv "$file.tmp" "$file"
 

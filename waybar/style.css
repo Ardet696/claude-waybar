@@ -8,6 +8,10 @@
 #custom-claude.running {
 	color: #f9e2af;
 }
+#custom-claude.agents {
+	color: #94e2d5;
+}
+
 #custom-claude.waiting {
 	color: #cba6f7;
 }
